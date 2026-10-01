@@ -1,5 +1,4 @@
 import shutil
-from distutils.dir_util import copy_tree
 
 import os
 import glob
@@ -22,6 +21,10 @@ def get_dirs(topic_path):
 def read_alert(folder):
     pdf = pd.read_parquet(folder)
     return pdf
+
+# Band labels/colors. fid 1,2 = g,r (ZTF); fid 1..4 = g,r,i,z (Rubin/LSST, see prepare_lsst.py).
+FILTDIC = {1: 'g', 2: 'r', 3: 'i', 4: 'z'}
+COLORDIC = {1: 'C0', 2: 'C1', 3: 'C2', 4: 'C3'}
 
 def get_lc(
         df_alerts, name, fid_column='fid', magpsf_column='magpsf', jd_column='jd',
@@ -173,11 +176,7 @@ def plot_lc(
 
     fig = plt.figure(figsize=(15, 6))
 
-    # Colors to plot
-    colordic = {1: 'C0', 2: 'C1'}
-
-    # Labels of ZTF filters
-    filtdic = {1: 'g', 2: 'r'}
+    colordic, filtdic = COLORDIC, FILTDIC
 
     for filt in np.unique(pdf[fid_column]):
         # select data from one filter at a time
@@ -245,15 +244,11 @@ def plot_lc_normalized_data(observed_data, observed_mask, observed_tp, title=Non
     observed_tp = data[index, :, -1].cpu().detach().numpy()
     ```
     """
-    dim = 2
+    dim = observed_data.shape[-1]
     # Replace observed values that are zero with nan since they are unobserved and must not show as zero in the plot.
     observed_data[observed_data == 0] = np.nan
 
-    # Colors to plot
-    colordic = {1: 'C0', 2: 'C1'}
-
-    # Labels of ZTF filters
-    filtdic = {1: 'g', 2: 'r'}
+    colordic, filtdic = COLORDIC, FILTDIC
 
     fig, ax = plt.subplots(1, 1, figsize=(15, 6))
     for i in range(dim):

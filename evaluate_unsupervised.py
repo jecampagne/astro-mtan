@@ -25,7 +25,7 @@ dec_num_heads = 1
 sample_tp = 1.0
 num_sample = 1
 embed_time = 128
-dim = 2
+dim = 4  # g,r,i,z (Rubin/LSST). Use 2 for ZTF g,r.
 seed = 42
 store_decoded_lcs = True
 # NOTE: Change the `SETTING` based on which dataset to evaluate the model on.

@@ -1,6 +1,6 @@
 import models
 import torch
-dim=2
+dim = 4  # g,r,i,z (Rubin/LSST). Use 2 for ZTF g,r.
 device='cuda' if torch.cuda.is_available() else 'cpu'
 val_loader = torch.load('val_dataloader.pth')
 from mtan_utils import *

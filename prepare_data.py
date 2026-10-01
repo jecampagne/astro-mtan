@@ -147,6 +147,15 @@ class MyDataSet(torch.utils.data.Dataset):
         return x, y
 
 
+
+def _too_few_points(observed_mask, min_datapoints_each_filter):
+    """True if the light curve is too sparse to be truncated.
+    Only bands that are actually observed in this light curve are considered
+    (with 4 bands griz, one band is often totally unobserved)."""
+    counts = observed_mask.sum(0)
+    counts = counts[counts > 0]
+    return counts.numel() == 0 or bool(torch.any(counts < min_datapoints_each_filter))
+
 class TruncateLightCurve(object):
     """Takes in a light curve, randomly selects percentage of observed time points to sample within the range
     provided by `percentage_tp_to_sample_range` and selects observed time points randomly from the
@@ -169,7 +178,7 @@ class TruncateLightCurve(object):
         observed_mask = x[:, self.dim:2 * self.dim]
         # Check if no. of datapoints is <self.min_datapoints_each_filter across any filter
         # If so, not sufficient points to truncate the light curve, so don't apply truncate transformation.
-        if torch.any(observed_mask.sum(0) < self.min_datapoints_each_filter):
+        if _too_few_points(observed_mask, self.min_datapoints_each_filter):
             return x
         else:
             #if torch.rand(1) >= self.p:
@@ -211,7 +220,7 @@ class ContinuousTruncateLightCurve(object):
         observed_mask = x[:, self.dim:2 * self.dim]
         # Check if no. of datapoints is <self.min_datapoints_each_filter across any filter
         # If so, not sufficient points to truncate the light curve, so don't apply truncate transformation.
-        if torch.any(observed_mask.sum(0) < self.min_datapoints_each_filter):
+        if _too_few_points(observed_mask, self.min_datapoints_each_filter):
             return x
         else:
             #if torch.rand(1) >= self.p:
@@ -288,7 +297,7 @@ class TruncateFirstXMonthsLightCurve(object):
         observed_tp   = x[:, -1]
 
         # Only check min_datapoints on the ORIGINAL LC before truncation
-        if torch.any(observed_mask.sum(0) < self.min_datapoints_each_filter):
+        if _too_few_points(observed_mask, self.min_datapoints_each_filter):
             return x
 
         # Keep only time points WITHIN the first X months
@@ -348,7 +357,7 @@ def prepare_data(df_alerts, dim=2, train_size=0.7, train_batch_size=32, classify
     # Since we aim to do global time normalization, we first need to find the max and min times (the absolute values and not the no. of datapoints) across the entire dataset. **NOTE: This loop should NOT be used if applying the model on a totally new data instance since we must use the min_time/max_time calculated during training and not calculate it again.**
     # FIRST, we do the loop only to find the min/max times across the dataset. Then the second loop performs the global time normalization using the max time found in the first loop.
     # min_max_mags to store the min/max mag so that these values can be used to unnormalize the light curves later. This is because mag normalization is locally done for each lc. We don't need to save the min/max values for the time (x-axis) since time is normalized globally, so a singel value across the dataset suffices.
-    min_time, max_time, duration_lcs, min_max_magdiffs, min_max_mags = np.Inf, -np.Inf, [], [], []
+    min_time, max_time, duration_lcs, min_max_magdiffs, min_max_mags = np.inf, -np.inf, [], [], []
     for objId in df_alerts['objectId'].unique():
         lc_data = get_lc(df_alerts, objId, make_first_time_zero=True, convert_to_tensor=convert_to_tensor, normalize_times=False, max_time=None, min_time=None, time_in_hrs=time_in_hrs, magpsf_column=magpsf_column, sigmapsf_column=sigmapsf_column)  # returns a tuple (object_Id, tt, vals, mask, labels). objectId will be a string, no. of entries/rows in tt, vals, and mask will be `n` = the total no. of alerts (including all bands) for that objectId
         assert lc_data[0] == objId
@@ -410,7 +419,7 @@ def prepare_data(df_alerts, dim=2, train_size=0.7, train_batch_size=32, classify
             break
         print(td[1][-1])
 
-    if custom_train_min_time is not None and custom_train_max_time is not None:
+    if custom_train_min_time is None or custom_train_max_time is None:
         # Find the min and max times for train, val, and test sets.
         train_min_time = np.min([td[1].min() for td in train_data])
         train_max_time = np.max([td[1].max() for td in train_data])
@@ -695,7 +704,7 @@ def prepare_data_graph_test(df_alerts, dim=2, train_size=0.7, train_batch_size=3
     # Since we aim to do global time normalization, we first need to find the max and min times (the absolute values and not the no. of datapoints) across the entire dataset. **NOTE: This loop should NOT be used if applying the model on a totally new data instance since we must use the min_time/max_time calculated during training and not calculate it again.**
     # FIRST, we do the loop only to find the min/max times across the dataset. Then the second loop performs the global time normalization using the max time found in the first loop.
     # min_max_mags to store the min/max mag so that these values can be used to unnormalize the light curves later. This is because mag normalization is locally done for each lc. We don't need to save the min/max values for the time (x-axis) since time is normalized globally, so a singel value across the dataset suffices.
-    min_time, max_time, duration_lcs, min_max_magdiffs, min_max_mags = np.Inf, -np.Inf, [], [], []
+    min_time, max_time, duration_lcs, min_max_magdiffs, min_max_mags = np.inf, -np.inf, [], [], []
     for objId in df_alerts['objectId'].unique():
         lc_data = get_lc(df_alerts, objId, make_first_time_zero=True, convert_to_tensor=convert_to_tensor, normalize_times=False, max_time=None, min_time=None, time_in_hrs=time_in_hrs)  # returns a tuple (object_Id, tt, vals, mask, labels). objectId will be a string, no. of entries/rows in tt, vals, and mask will be `n` = the total no. of alerts (including all bands) for that objectId
         assert lc_data[0] == objId

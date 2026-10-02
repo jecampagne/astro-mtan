@@ -17,7 +17,9 @@ DIM = 4
 TAG = TOPIC_PATH.rstrip('/').split('/')[-1].replace('-', '_')
 
 df_alerts = load_lsst_alerts(TOPIC_PATH, flux_mode=FLUX_MODE, snr_min=5.0)
-df_alerts = select_objects(df_alerts, min_total=10, min_per_band=3, min_bands=2)
+#df_alerts = select_objects(df_alerts, min_total=10, min_per_band=3, min_bands=2)
+df_alerts = select_objects(df_alerts, min_total=10, min_per_band=3, min_bands=2, 
+                           min_duration_days=None, min_nights=3)
 
 # get_lc builds its channels with np.unique(fid) over the WHOLE dataframe: all 4 bands must be present.
 assert sorted(df_alerts['fid'].unique()) == [1, 2, 3, 4], \

@@ -241,7 +241,7 @@ if __name__ == '__main__':
         total_time += time.time() - start_time
         # Run validation
         return_mse = True
-        val_metric = mtan_utils.evaluate(dim, rec, dec, val_loader, args, 1, device=device, kl_coef=kl_coef, return_mse=return_mse)
+        val_metric = mtan_utils.evaluate(dim, rec, dec, val_loader, args, 1, device=device, kl_coef=kl_coef, return_mse=return_mse, train_val_test_min_max_times_filename=args.train_val_test_min_max_times_filename)
         if args.use_wandb:
             if return_mse:
                 wandb.log({'val_mse': val_metric})
@@ -269,7 +269,7 @@ if __name__ == '__main__':
         print('Iter: {}, avg elbo: {:.4f}, avg reconst: {:.4f}, avg kl: {:.4f}, mse: {:.6f}, val_metric: {:.6f}'
                 .format(itr, train_loss / train_n, -avg_reconst / train_n, avg_kl / train_n, mse / train_n, val_metric))
         if itr % 5 == 0:
-            print('Test Mean Squared Error', mtan_utils.evaluate(dim, rec, dec, test_loader, args, 1, device=device, return_mse=True))
+            print('Test Mean Squared Error', mtan_utils.evaluate(dim, rec, dec, test_loader, args, 1, device=device, return_mse=True, train_val_test_min_max_times_filename=args.train_val_test_min_max_times_filename))
 
     print(f'Time elapsed {total_time/60:.2f} min')
     if args.use_wandb:

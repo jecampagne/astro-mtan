@@ -80,7 +80,7 @@ if __name__ == '__main__':
         dim, latent_dim, gen_hidden,
         embed_time=embed_time, learn_emb=learn_emb, num_heads=dec_num_heads, device=device).to(device)
 
-    model_file = torch.load(model_file_path, weights_only=False)  # checkpoint contains the argparse Namespace
+    model_file = torch.load(model_file_path, weights_only=False, map_location=device)  # Namespace in checkpoint; tensors saved on GPU -> map to CPU
     rec.load_state_dict(model_file['rec_state_dict'])
     rec.eval()
     dec.load_state_dict(model_file['dec_state_dict'])

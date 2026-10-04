@@ -65,9 +65,12 @@ class ContinuousTruncateLightCurve(object):
                                 high=self.percentage_tp_to_sample_range[1])
         observed_data = x[:, :self.dim]
         observed_tp = x[:, -1]
+        # subsample_timepoints_continuous_window works on BATCHED tensors (B, T, D) / (B, T):
+        # add a batch dimension of 1 for this single light curve, then remove it.
         sub_data, sub_tp, sub_mask = subsample_timepoints_continuous_window(
-            observed_data.clone(), observed_tp.clone(), observed_mask.clone(),
-            percentage_tp_to_sample=pct)
+            observed_data.clone().unsqueeze(0), observed_tp.clone().unsqueeze(0),
+            observed_mask.clone().unsqueeze(0), percentage_tp_to_sample=pct)
+        sub_data, sub_tp, sub_mask = sub_data.squeeze(0), sub_tp.squeeze(0), sub_mask.squeeze(0)
         return torch.cat((sub_data, sub_mask, sub_tp.unsqueeze(-1)), 1)
 
 

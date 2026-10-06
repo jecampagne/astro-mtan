@@ -16,15 +16,43 @@ import pandas as pd
 BANDS = ["g", "r", "i", "z"]                          # fixed order = channels 0..3
 BAND2FID = {b: k + 1 for k, b in enumerate(BANDS)}    # g=1 r=2 i=3 z=4
 NJY_AB_ZP = 31.4                                      # mag_AB = 31.4 - 2.5 log10(flux_nJy)
+NIGHT_OFFSET = 0.65   # a Chilean night straddles 00:00 UTC: nights are split at ~15:30 UTC (MJD fraction 0.65)
 
 
-def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0):
+def night_index(jd):
+    """Integer index of the observing night (single definition used everywhere)."""
+    return np.floor(np.asarray(jd, dtype="float64") - NIGHT_OFFSET).astype("int64")
+
+
+def combine_same_night_same_band(d):
+    """
+    Merge detections of the same object, in the same band, during the same night.
+    `d` has columns objectId, jd, fid, flux, err (flux in nJy, err = 1-sigma).
+    Inverse-variance weighted mean (w = 1/err^2):
+        flux = sum(w*flux)/sum(w),   err = 1/sqrt(sum(w)),   jd = sum(w*jd)/sum(w)
+    A night with a single detection is left unchanged.
+    """
+    w = 1.0 / d["err"].values ** 2
+    work = pd.DataFrame({"objectId": d["objectId"].values, "fid": d["fid"].values,
+                         "night": night_index(d["jd"].values),
+                         "w": w, "wf": w * d["flux"].values, "wt": w * d["jd"].values})
+    s = work.groupby(["objectId", "fid", "night"], sort=False)[["w", "wf", "wt"]].sum().reset_index()
+    out = pd.DataFrame({"objectId": s["objectId"], "fid": s["fid"], "jd": s["wt"] / s["w"],
+                        "flux": s["wf"] / s["w"], "err": 1.0 / np.sqrt(s["w"])})
+    print(f"same-night/same-band combination: {len(d)} -> {len(out)} points "
+          f"({len(d) - len(out)} merged)")
+    return out
+
+
+def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0, combine_nights=True):
     """
     flux_mode:
       'diff'    -> psfFlux (difference image: variation w.r.t. the template, host subtracted).
                    ZTF analogue: magpsf with isdiffpos == 't' (SN case of the paper).
       'science' -> scienceFlux (total flux on the science image, host included).
                    Analogue of the lc_correction used for AGN.
+    combine_nights: merge detections of the same object/band/night (inverse-variance weighted mean
+                    in flux). Done AFTER the SNR cut and BEFORE the conversion to magnitudes.
     """
     # dtype_backend="pyarrow": diaObjectId values (~3e17 > 2**53) must stay 64-bit integers.
     # With null values, the numpy backend would cast them to float64 and silently merge distinct objects.
@@ -49,12 +77,20 @@ def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0):
     keep = (flux > 0) & (err > 0) & (flux / err > snr_min)   # also guarantees flux > 0 for the log
     df, flux, err = df[keep], flux[keep], err[keep]
 
-    out = pd.DataFrame({
+    det = pd.DataFrame({
         "objectId": df["diaObjectId"].astype("int64").astype(str).values,
         "jd": df["midpointMjdTai"].values,             # MJD in days: only time differences matter
         "fid": df["band"].map(BAND2FID).astype(int).values,
-        "magpsf": NJY_AB_ZP - 2.5 * np.log10(flux.values),
-        "sigmapsf": 1.0857 * err.values / flux.values,
+        "flux": flux.values, "err": err.values})
+    if combine_nights:
+        det = combine_same_night_same_band(det)
+
+    out = pd.DataFrame({
+        "objectId": det["objectId"].values,
+        "jd": det["jd"].values,
+        "fid": det["fid"].values,
+        "magpsf": NJY_AB_ZP - 2.5 * np.log10(det["flux"].values),
+        "sigmapsf": 1.0857 * det["err"].values / det["flux"].values,
         # get_lc / prepare_data read these label columns; without Fink classes we use a single label.
         "finkclass": "lsst",
         "tnsclass": "Unknown",
@@ -68,7 +104,7 @@ def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0):
 def count_nights(jd):
     """Number of distinct observing nights. A Chilean night straddles 00:00 UTC, so nights are split
     at ~15:30 UTC (local noon): MJD fraction 0.65."""
-    return np.unique(np.floor(np.asarray(jd) - 0.65)).size
+    return np.unique(night_index(jd)).size
 
 
 def object_stats(df):
@@ -81,9 +117,9 @@ def object_stats(df):
                   .reindex(columns=[1, 2, 3, 4], fill_value=0))
     per_band.columns = BANDS
     st = st.join(per_band)
-    # same night definition as count_nights: floor(MJD - 0.65)
+    # same night definition as count_nights (night_index)
     night = pd.DataFrame({"objectId": df["objectId"].values,
-                          "night": np.floor(df["jd"].values - 0.65)}).drop_duplicates()
+                          "night": night_index(df["jd"].values)}).drop_duplicates()
     st["n_nights"] = night.groupby("objectId", sort=False).size()
     return st
 

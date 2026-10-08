@@ -103,6 +103,30 @@ def get_lc(
 
     return data
 
+def get_lc_weights(
+        df_alerts, name, weight_column='weight', fid_column='fid', jd_column='jd',
+        objectId_column='objectId', convert_to_tensor=False
+    ):
+    """Per-point weights of the light curve `name`, aligned with the arrays returned by `get_lc`.
+
+    Same selection, same sort (by `jd_column`) and same band order (np.unique over the whole `df_alerts`)
+    as `get_lc`, so the returned (seqlen x num_channels) array has the same layout as
+    `observation_data` / `observation_mask`: weight where the band is observed, 0 elsewhere.
+    `get_lc` itself is left untouched (its 5-tuple is unpacked in many places).
+    """
+    pdf = df_alerts[df_alerts[objectId_column] == name].sort_values(by=jd_column)
+    if pdf.empty:
+        raise ValueError(f'No alerts exist for objectId = {name}, so cannot make a light curve!')
+
+    weights = []
+    for filt in np.unique(df_alerts[fid_column]):
+        maskFilt = pdf[fid_column] == filt
+        weights.append(pdf[weight_column] * maskFilt)
+    weights = np.array(weights).T  # seqlen x num_channels
+    if convert_to_tensor:
+        weights = torch.from_numpy(weights)
+    return weights
+
 def normalize_time_values(times, local_time_normalization=False, max_time=None, min_time=None):
     """`times` must start with zero and be in units of hours. This function assumes that.
     times are multipled by 48 after normalization which means the normalized time valus lie in [0, 48] hours.

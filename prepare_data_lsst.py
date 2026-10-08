@@ -13,7 +13,7 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 
-from utils import get_lc
+from utils import get_lc, get_lc_weights
 from mtan_utils import variable_time_collate_fn, subsample_timepoints_continuous_window
 
 
@@ -58,6 +58,10 @@ class ContinuousTruncateLightCurve(object):
 
     def __call__(self, x):
         # x: (num_points, dim + dim + 1) = [data | mask | time]
+        #    or (num_points, 3 * dim + 1) = [data | mask | weight | time] when point weights are used.
+        has_weight = x.shape[1] == 3 * self.dim + 1
+        if not has_weight and x.shape[1] != 2 * self.dim + 1:
+            raise ValueError(f'Unexpected number of channels {x.shape[1]} for dim={self.dim}.')
         observed_mask = x[:, self.dim:2 * self.dim]
         if _too_few_points(observed_mask, self.min_datapoints_each_filter):
             return x
@@ -71,6 +75,10 @@ class ContinuousTruncateLightCurve(object):
             observed_data.clone().unsqueeze(0), observed_tp.clone().unsqueeze(0),
             observed_mask.clone().unsqueeze(0), percentage_tp_to_sample=pct)
         sub_data, sub_tp, sub_mask = sub_data.squeeze(0), sub_tp.squeeze(0), sub_mask.squeeze(0)
+        if has_weight:
+            # Points cut out of the window have mask 0: zero their weight too (invariant: weight > 0 <=> mask == 1).
+            sub_weight = x[:, 2 * self.dim:3 * self.dim] * sub_mask
+            return torch.cat((sub_data, sub_mask, sub_weight, sub_tp.unsqueeze(-1)), 1)
         return torch.cat((sub_data, sub_mask, sub_tp.unsqueeze(-1)), 1)
 
 
@@ -88,9 +96,13 @@ class apply_truncate_transform_random:
 
 def prepare_data(df_alerts, dim=2, train_size=0.7, train_batch_size=32, classify=False, activity=False,
                  convert_to_tensor=False, custom_train_min_time=None, custom_train_max_time=None,
-                 magpsf_column='magpsf', sigmapsf_column='sigmapsf'):
+                 magpsf_column='magpsf', sigmapsf_column='sigmapsf', weight_column=None):
     """Same behaviour/outputs as prepare_data.prepare_data (minus the AGN <3 months side-file).
-    Pass `custom_train_min_time`/`custom_train_max_time` only when applying to new data."""
+    Pass `custom_train_min_time`/`custom_train_max_time` only when applying to new data.
+
+    weight_column: name of a per-detection weight column of `df_alerts` (see prepare_lsst.compute_weights).
+    If given, the combined tensors are [data | mask | weight | time] instead of [data | mask | time].
+    The train/val/test split is unchanged (same seed, same list of objects)."""
     device = 'cpu'          # no GPU needed to prepare the data
     time_in_hrs = True
 
@@ -112,7 +124,7 @@ def prepare_data(df_alerts, dim=2, train_size=0.7, train_batch_size=32, classify
     print(f'Max and Min time values (hrs) across the dataset: {max_time}, {min_time}')
 
     # --- Pass 2: build the light curves
-    total_data, total_objId, total_common_finkclasses = [], [], []
+    total_data, total_objId, total_common_finkclasses, total_weights = [], [], [], []
     for objId in df_alerts['objectId'].unique():
         lc_data = get_lc(df_alerts, objId, make_first_time_zero=True, convert_to_tensor=convert_to_tensor,
                          normalize_times=False, local_time_normalization=False,
@@ -121,14 +133,31 @@ def prepare_data(df_alerts, dim=2, train_size=0.7, train_batch_size=32, classify
         total_data.append(lc_data)
         total_objId.append(objId)
         total_common_finkclasses.append(lc_data[-1])
+        if weight_column is not None:
+            w = get_lc_weights(df_alerts, objId, weight_column=weight_column, convert_to_tensor=convert_to_tensor)
+            # Alignment guard: weights must be positive exactly where a band is observed.
+            assert w.shape == lc_data[3].shape and bool(((w > 0) == (lc_data[3] > 0)).all()), \
+                f'weights misaligned with the light curve of {objId}'
+            total_weights.append(w)
 
     data_min, data_max = None, None
 
     # --- Split (same seeds as the original => same split)
-    train_data, test_data, train_data_objId, test_data_objId = train_test_split(
-        total_data, total_objId, train_size=train_size, random_state=42, shuffle=True)
-    train_data, val_data, train_data_objId, val_data_objId = train_test_split(
-        train_data, train_data_objId, train_size=0.8, random_state=42, shuffle=True)
+    # The permutation depends only on the number of samples and random_state, so adding the weights as a third
+    # array gives exactly the same split as without them.
+    if weight_column is not None:
+        (train_data, test_data, train_data_objId, test_data_objId,
+         train_weights, test_weights) = train_test_split(
+            total_data, total_objId, total_weights, train_size=train_size, random_state=42, shuffle=True)
+        (train_data, val_data, train_data_objId, val_data_objId,
+         train_weights, val_weights) = train_test_split(
+            train_data, train_data_objId, train_weights, train_size=0.8, random_state=42, shuffle=True)
+    else:
+        train_data, test_data, train_data_objId, test_data_objId = train_test_split(
+            total_data, total_objId, train_size=train_size, random_state=42, shuffle=True)
+        train_data, val_data, train_data_objId, val_data_objId = train_test_split(
+            train_data, train_data_objId, train_size=0.8, random_state=42, shuffle=True)
+        train_weights = val_weights = test_weights = None
 
     if custom_train_min_time is None or custom_train_max_time is None:
         train_min_time = np.min([td[1].min() for td in train_data])
@@ -147,9 +176,9 @@ def prepare_data(df_alerts, dim=2, train_size=0.7, train_batch_size=32, classify
     # --- Collate (normalisation of the time with the TRAIN min/max, for all three splits)
     kw = dict(classify=classify, activity=activity, data_min=data_min, data_max=data_max,
               train_min_time=train_min_time, train_max_time=train_max_time)
-    train_data_combined, train_data_Ids = variable_time_collate_fn(train_data, device, **kw)
-    val_data_combined, val_data_Ids = variable_time_collate_fn(val_data, device, **kw)
-    test_data_combined, test_data_Ids = variable_time_collate_fn(test_data, device, **kw)
+    train_data_combined, train_data_Ids = variable_time_collate_fn(train_data, device, weights=train_weights, **kw)
+    val_data_combined, val_data_Ids = variable_time_collate_fn(val_data, device, weights=val_weights, **kw)
+    test_data_combined, test_data_Ids = variable_time_collate_fn(test_data, device, weights=test_weights, **kw)
 
     assert np.all(train_data_objId == train_data_Ids)
     assert np.all(test_data_objId == test_data_Ids)

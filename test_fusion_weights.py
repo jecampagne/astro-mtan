@@ -113,7 +113,7 @@ def test_prepare_data_and_truncation(df):
 
 def run(script, args, cwd):
     r = subprocess.run([sys.executable, os.path.join(HERE, script), *args], cwd=cwd, capture_output=True, text=True,
-                       env={**os.environ, 'PYTHONPATH': HERE})
+                       env={**os.environ, 'PYTHONPATH': HERE, 'CUDA_VISIBLE_DEVICES': ''})   # CPU only: tiny data, no GPU needed
     assert r.returncode == 0, f'{script} failed\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}'
     return r.stdout
 

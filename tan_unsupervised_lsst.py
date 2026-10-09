@@ -54,6 +54,9 @@ parser.add_argument('--dim', type=int, help='dim value')
 parser.add_argument('--use_wandb', action='store_true', help='whether to use wandb')
 parser.add_argument('--train_val_test_min_max_times_filename', type=str, default='train_val_test_min_max_times.npy')
 parser.add_argument('--ref-resolution-days', type=float, default=2)
+parser.add_argument('--run-suffix', type=str, default='',
+                    help="Optional suffix added to the name of the best-checkpoint file "
+                         "(<dataset>_<enc>_<dec>[_noweights]<run-suffix>.h5).")
 parser.add_argument('--use-weights', action=argparse.BooleanOptionalAction, default=True,
                     help="Weight the data-fit term and the MSE by the per-point weight channel "
                          "([data | mask | weight | time] tensors made by main_preprocessing_lsst_from_parquet.py). "
@@ -93,6 +96,12 @@ if __name__ == '__main__':
     elif _has_weight_channel and not args.use_weights:
         print('Data has a weight channel but --no-use-weights was given: running UNWEIGHTED.')
     print('Weighted loss and metrics:', args.use_weights)
+
+    # Name of the best-checkpoint file. Running on data that HAS a weight channel with --no-use-weights would write
+    # to the same file as the weighted run: tag it. Without weight channel (old data) the name is unchanged.
+    _weight_tag = '_noweights' if (_has_weight_channel and not args.use_weights) else ''
+    ckpt_name = args.dataset + '_' + args.enc + '_' + args.dec + _weight_tag + args.run_suffix + '.h5'
+    print('Best checkpoint will be saved to:', ckpt_name)
 
     # model
     if args.enc == 'enc_rnn3':
@@ -281,7 +290,7 @@ if __name__ == '__main__':
                 'rec_state_dict': rec_state_dict,
                 'dec_state_dict': dec_state_dict,
                 'optimizer_state_dict': optimizer_state_dict,
-            }, args.dataset + '_' + args.enc + '_' + args.dec + '.h5')
+            }, ckpt_name)
 
         # Validation end.
         #scheduler.step(val_metric)

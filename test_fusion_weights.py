@@ -140,7 +140,12 @@ def test_end_to_end():
         assert 'Weighted loss and metrics: True' in out and 'val_mse_unw' in out, out[-2000:]
         out = train('ftransfer_lsst_test_winvvar', '--no-use-weights')
         assert 'Weighted loss and metrics: False' in out and 'val_mse_unw' not in out, out[-2000:]
-        out = train('ftransfer_lsst_test')                 # no weight channel
+        base = 'lsst_ftransfer_lsst_test_winvvar_mtan_rnn_mtan_rnn'
+        assert os.path.exists(os.path.join(tmp, base + '.h5')), 'weighted checkpoint missing'
+        assert os.path.exists(os.path.join(tmp, base + '_noweights.h5')), \
+            'the --no-use-weights run must not overwrite the weighted checkpoint'
+        out = train('ftransfer_lsst_test', '--run-suffix', '_x')   # no weight channel
+        assert os.path.exists(os.path.join(tmp, 'lsst_ftransfer_lsst_test_mtan_rnn_mtan_rnn_x.h5'))
         assert 'WARNING: --use-weights requested' in out and 'val_mse_unw' not in out, out[-2000:]
         print('ok test_end_to_end')
     finally:

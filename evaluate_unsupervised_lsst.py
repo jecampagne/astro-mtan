@@ -8,6 +8,8 @@ from torch.utils.data import DataLoader
 from prepare_data_lsst import MyDataSet
 from torch.nn.utils.rnn import pad_sequence
 
+import json
+import os
 import time
 import argparse
 
@@ -20,6 +22,11 @@ parser.add_argument('--setting', type=str, default='test', choices=['test', 'val
 parser.add_argument('--model_file', type=str, default=None,
                     help='Default: lsst_<tag>_mtan_rnn_mtan_rnn.h5 (name written by tan_unsupervised_lsst.py --dataset lsst_<tag>)')
 parser.add_argument('--latent-dim', type=int, default=4, help='Must match training.')
+parser.add_argument('--run-suffix', type=str, default=None,
+                    help='Suffix of the output files (evaluate_<setting>_..._<tag><run-suffix>.*). Default: derived '
+                         'from the checkpoint name, i.e. what follows lsst_<tag>_mtan_rnn_mtan_rnn in it '
+                         "('' for the default checkpoint, '_noweights_s1' for lsst_<tag>_mtan_rnn_mtan_rnn_noweights_s1.h5), "
+                         'so that evaluating several runs of the same data never overwrites the outputs.')
 args = parser.parse_args()
 TAG = args.tag
 
@@ -43,6 +50,18 @@ SETTING = args.setting  # 'test', 'val' or 'train'
 DATA_COMBINED_PATH = f'{SETTING}_data_combined_{TAG}.pth'
 DATA_IDS_PATH = f'{SETTING}_objIds_{TAG}.npy'
 model_file_path = args.model_file or f'lsst_{TAG}_mtan_rnn_mtan_rnn.h5'
+
+
+def run_suffix_from(model_path, tag):
+    """'' for the default checkpoint name, else what follows lsst_<tag>_mtan_rnn_mtan_rnn (without .h5)."""
+    base = os.path.basename(model_path)
+    base = base[:-3] if base.endswith('.h5') else base
+    std = f'lsst_{tag}_mtan_rnn_mtan_rnn'
+    return base[len(std):] if base.startswith(std) else '_' + base
+
+
+RUN = args.run_suffix if args.run_suffix is not None else run_suffix_from(model_file_path, TAG)
+OUT = f'{TAG}{RUN}'   # tag used in all output file names
 
 if __name__ == '__main__':
     # Set seed during testing as well since this script samples random values for the variable, epsilon.
@@ -86,6 +105,15 @@ if __name__ == '__main__':
     dec.load_state_dict(model_file['dec_state_dict'])
     dec.eval()
 
+    ck_args = model_file.get('args')
+    ck_epoch = model_file.get('epoch')
+    ck_use_weights = getattr(ck_args, 'use_weights', None)   # None: checkpoint older than the weighting
+    print(f"Checkpoint {model_file_path}: epoch {ck_epoch}, trained with use_weights={ck_use_weights}, "
+          f"seed={getattr(ck_args, 'seed', None)}, dataset={getattr(ck_args, 'dataset', None)}")
+    print(f"Output files tagged: {OUT}")
+    has_weight_channel = data_combined.shape[-1] == 3 * dim + 1
+    print(f"Data has a weight channel: {has_weight_channel}")
+
     ########### Check model size ###########
     def get_model_size(model):
         param_size = 0
@@ -105,9 +133,10 @@ if __name__ == '__main__':
 
     outputs = []
     objIds = []
-    test_n, mse = 0, 0.0
+    test_n, mse, mse_w = 0, 0.0, 0.0
     if store_decoded_lcs:
         decoded_lcs = []
+        weights_lcs = []
 
     start = time.time()
 
@@ -179,6 +208,10 @@ if __name__ == '__main__':
                 pred_x = pred_x.view(num_sample, -1, pred_x.shape[1], pred_x.shape[2])
                 pred_x = pred_x.mean(0)
                 mse += mean_squared_error(observed_data, pred_x, observed_mask) * batch
+                if has_weight_channel:
+                    point_weight = test_batch[:, :, 2 * dim:3 * dim]
+                    mse_w += mean_squared_error(observed_data, pred_x, observed_mask, weight=point_weight) * batch
+                    weights_lcs.append(point_weight.cpu().detach().numpy()[0])   # (T, dim), 0 where not observed
                 test_n += batch
 
                 #print(pred_x.shape, time_steps.shape, time_steps.unsqueeze(2).shape)
@@ -206,12 +239,23 @@ if __name__ == '__main__':
     objIds = list(chain.from_iterable(objIds))
 
     if store_decoded_lcs:
-        print(f'MSE = {mse/test_n}')
+        print(f'MSE = {mse/test_n}')   # unweighted, mean over curves of the per-curve MSE (same as val_mse_unw)
+        if has_weight_channel:
+            print(f'MSE weighted = {mse_w/test_n}')
 
-    np.save(f'evaluate_{SETTING}_outputs_condensed_{TAG}.npy', outputs_condensed)
-    np.save(f'evaluate_{SETTING}_objIds_dataloader_{TAG}.npy', objIds)
+    np.save(f'evaluate_{SETTING}_outputs_condensed_{OUT}.npy', outputs_condensed)
+    np.save(f'evaluate_{SETTING}_objIds_dataloader_{OUT}.npy', objIds)
 
     assert np.all(objIds == data_Ids)
 
     if store_decoded_lcs:
-        np.savez(f'evaluate_{SETTING}_decoded_lcs_{TAG}.npz', *decoded_lcs)
+        np.savez(f'evaluate_{SETTING}_decoded_lcs_{OUT}.npz', *decoded_lcs)
+        if has_weight_channel:
+            np.savez(f'evaluate_{SETTING}_weights_{OUT}.npz', *weights_lcs)
+        info = dict(tag=TAG, run=RUN, setting=SETTING, checkpoint=model_file_path, epoch=ck_epoch,
+                    use_weights=ck_use_weights, seed=getattr(ck_args, 'seed', None), n_curves=len(dataset),
+                    mse_unweighted=float(mse / test_n),
+                    mse_weighted=float(mse_w / test_n) if has_weight_channel else None)
+        with open(f'evaluate_{SETTING}_info_{OUT}.json', 'w') as f:
+            json.dump(info, f, indent=2)
+        print('Summary:', info)

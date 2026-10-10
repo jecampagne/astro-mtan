@@ -215,7 +215,7 @@ if __name__ == '__main__':
                 test_n += batch
 
                 #print(pred_x.shape, time_steps.shape, time_steps.unsqueeze(2).shape)
-                print(pred_x.shape, observed_data.shape, observed_mask.shape)
+                #print(pred_x.shape, observed_data.shape, observed_mask.shape)
                 decoded_lcs.append(
                     np.vstack(
                         (pred_x.cpu().detach().numpy(), observed_data.cpu().detach().numpy(), observed_mask.cpu().detach().numpy(), np.repeat(time_steps.unsqueeze(2).cpu().detach().numpy(), dim, axis=2))

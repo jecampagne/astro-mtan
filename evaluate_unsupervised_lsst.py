@@ -21,7 +21,8 @@ parser.add_argument('--tag', type=str, required=True,
 parser.add_argument('--setting', type=str, default='test', choices=['test', 'val', 'train'])
 parser.add_argument('--model_file', type=str, default=None,
                     help='Default: lsst_<tag>_mtan_rnn_mtan_rnn.h5 (name written by tan_unsupervised_lsst.py --dataset lsst_<tag>)')
-parser.add_argument('--latent-dim', type=int, default=4, help='Must match training.')
+parser.add_argument('--latent-dim', type=int, default=None,
+                    help='Default: read from the checkpoint. If given, it must match training.')
 parser.add_argument('--run-suffix', type=str, default=None,
                     help='Suffix of the output files (evaluate_<setting>_..._<tag><run-suffix>.*). Default: derived '
                          'from the checkpoint name, i.e. what follows lsst_<tag>_mtan_rnn_mtan_rnn in it '
@@ -33,16 +34,32 @@ TAG = args.tag
 #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = torch.device('cpu')  # Force to use CPU for evaluation since that closely mimics how the model will be used in real applications.
 # TODO: Add option to pass these arguments as argument parsers. These values must match from training. So instead save a training parameter file and simply load it here.
-ref_resolution_days = 2
-latent_dim = args.latent_dim
-learn_emb = True
-rec_hidden = 64
-gen_hidden = 50
-enc_num_heads = 1
-dec_num_heads = 1
+# Model hyperparameters are read from the checkpoint (args saved by tan_unsupervised_lsst.py); the values below are
+# the fallbacks for a checkpoint that does not carry them, and the initial values of the module-level names.
+HP_DEFAULTS = dict(latent_dim=4, rec_hidden=64, gen_hidden=50, embed_time=128, enc_num_heads=1, dec_num_heads=1,
+                   ref_resolution_days=2, learn_emb=True)
+
+
+def resolve_hparams(ck_args, cli_latent_dim=None):
+    """Hyperparameters of the checkpoint (training args), falling back on HP_DEFAULTS. --latent-dim, if given, must agree."""
+    hp = {k: (getattr(ck_args, k, v) if ck_args is not None else v) for k, v in HP_DEFAULTS.items()}
+    if cli_latent_dim is not None:
+        if ck_args is not None and hasattr(ck_args, 'latent_dim') and cli_latent_dim != ck_args.latent_dim:
+            raise ValueError(f'--latent-dim {cli_latent_dim} differs from the checkpoint ({ck_args.latent_dim}).')
+        hp['latent_dim'] = cli_latent_dim
+    return hp
+
+
+ref_resolution_days = HP_DEFAULTS['ref_resolution_days']
+latent_dim = args.latent_dim if args.latent_dim is not None else HP_DEFAULTS['latent_dim']
+learn_emb = HP_DEFAULTS['learn_emb']
+rec_hidden = HP_DEFAULTS['rec_hidden']
+gen_hidden = HP_DEFAULTS['gen_hidden']
+enc_num_heads = HP_DEFAULTS['enc_num_heads']
+dec_num_heads = HP_DEFAULTS['dec_num_heads']
 sample_tp = 1.0
 num_sample = 1
-embed_time = 128
+embed_time = HP_DEFAULTS['embed_time']
 dim = 4  # g,r,i,z (Rubin/LSST). Use 2 for ZTF g,r.
 seed = 42
 store_decoded_lcs = True
@@ -70,6 +87,14 @@ if __name__ == '__main__':
 
     if device == 'cuda':
         torch.cuda.manual_seed(seed)
+
+    # Checkpoint first: its training args give the model hyperparameters (latent_dim, hidden sizes, heads, reference grid).
+    model_file = torch.load(model_file_path, weights_only=False, map_location=device)  # Namespace in checkpoint; tensors saved on GPU -> map to CPU
+    hp = resolve_hparams(model_file.get('args'), args.latent_dim)
+    latent_dim, rec_hidden, gen_hidden, embed_time = hp['latent_dim'], hp['rec_hidden'], hp['gen_hidden'], hp['embed_time']
+    enc_num_heads, dec_num_heads = hp['enc_num_heads'], hp['dec_num_heads']
+    ref_resolution_days, learn_emb = hp['ref_resolution_days'], hp['learn_emb']
+    print('Model hyperparameters (from the checkpoint):', hp)
 
     data_combined = torch.load(DATA_COMBINED_PATH, weights_only=False)
     data_Ids = np.load(DATA_IDS_PATH)
@@ -99,7 +124,6 @@ if __name__ == '__main__':
         dim, latent_dim, gen_hidden,
         embed_time=embed_time, learn_emb=learn_emb, num_heads=dec_num_heads, device=device).to(device)
 
-    model_file = torch.load(model_file_path, weights_only=False, map_location=device)  # Namespace in checkpoint; tensors saved on GPU -> map to CPU
     rec.load_state_dict(model_file['rec_state_dict'])
     rec.eval()
     dec.load_state_dict(model_file['dec_state_dict'])
@@ -215,7 +239,7 @@ if __name__ == '__main__':
                 test_n += batch
 
                 #print(pred_x.shape, time_steps.shape, time_steps.unsqueeze(2).shape)
-                #print(pred_x.shape, observed_data.shape, observed_mask.shape)
+                print(pred_x.shape, observed_data.shape, observed_mask.shape)
                 decoded_lcs.append(
                     np.vstack(
                         (pred_x.cpu().detach().numpy(), observed_data.cpu().detach().numpy(), observed_mask.cpu().detach().numpy(), np.repeat(time_steps.unsqueeze(2).cpu().detach().numpy(), dim, axis=2))

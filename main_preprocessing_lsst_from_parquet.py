@@ -3,12 +3,13 @@ Seconde partie de main_preprocessing_lsst.py (machine avec torch/GPU).
 Lit le parquet produit par make_parquet_lsst.py.
 
 Usage: python main_preprocessing_lsst_from_parquet.py alerts_processed_<TAG>.parquet
-           [--weight {invvar,n,sqrt_n,none}] [--weight-floor-mag 0.05]
+           [--weight {none,n,sqrt_n,invvar}] [--weight-floor-mag 0.05]
 
---weight (default invvar): per-point weight of the data-fit term, stored as an extra channel of the tensors
-  ([data | mask | weight | time]) and used by tan_unsupervised_lsst.py (--use-weights). A point obtained by
-  merging several detections of the same night/band therefore counts more than a single detection.
-  'none' reproduces the previous output exactly ([data | mask | time], same file names).
+--weight (default none): per-point weight of the data-fit term. 'none' = every point counts 1 (merged or not):
+  tensors are [data | mask | time] and the file names have no suffix.
+  'n', 'sqrt_n' (and 'invvar') store the weight as an extra channel ([data | mask | weight | time]); a point obtained
+  by merging several detections of the same night/band then counts more than a single detection when
+  tan_unsupervised_lsst.py uses it (automatic when the channel exists, unless --no-use-weights).
   With a weighting, the output tag gets the suffix _w<mode> so that nothing is overwritten.
 """
 import argparse
@@ -21,8 +22,8 @@ from prepare_lsst import WEIGHT_MODES, compute_weights, weight_summary
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument('parquet', help='alerts_processed_<TAG>.parquet produced by make_parquet_lsst.py')
-parser.add_argument('--weight', default='invvar', choices=WEIGHT_MODES,
-                    help='per-point weighting of the likelihood (default: invvar)')
+parser.add_argument('--weight', default='none', choices=WEIGHT_MODES,
+                    help='per-point weighting of the likelihood: none (every point counts 1, default), n, sqrt_n, invvar')
 parser.add_argument('--weight-floor-mag', type=float, default=0.05,
                     help="intrinsic/model error floor (mag) in the 'invvar' weights (default: 0.05)")
 cli = parser.parse_args()
@@ -65,4 +66,4 @@ np.save(f'train_min_max_times_{TAG}.npy', data_obj['train_min_max_times'])
 print('Done. Now run tan_unsupervised_lsst.py with --dim 4 '
       f'--train_val_test_min_max_times_filename train_val_test_min_max_times_{TAG}.npy '
       f'--dataset lsst_{TAG}'
-      + (' [--use-weights is on by default; --no-use-weights ignores the weight channel]' if weight_column else ''))
+      + (' [weights are used automatically; --no-use-weights ignores the weight channel]' if weight_column else ''))

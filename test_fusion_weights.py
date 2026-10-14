@@ -111,9 +111,12 @@ def test_prepare_data_and_truncation(df):
     print('ok test_truncation')
 
 
-def run(script, args, cwd):
+def run(script, args, cwd, expect_fail=False):
     r = subprocess.run([sys.executable, os.path.join(HERE, script), *args], cwd=cwd, capture_output=True, text=True,
                        env={**os.environ, 'PYTHONPATH': HERE, 'CUDA_VISIBLE_DEVICES': ''})   # CPU only: tiny data, no GPU needed
+    if expect_fail:
+        assert r.returncode != 0, f'{script} should have failed\n{r.stdout[-2000:]}'
+        return r.stdout + r.stderr
     assert r.returncode == 0, f'{script} failed\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}'
     return r.stdout
 
@@ -126,27 +129,37 @@ def test_end_to_end():
         run('make_parquet_lsst.py', [topic], tmp)
         pq = 'alerts_processed_ftransfer_lsst_test.parquet'
         run('main_preprocessing_lsst_from_parquet.py', [pq, '--weight', 'invvar'], tmp)
-        run('main_preprocessing_lsst_from_parquet.py', [pq, '--weight', 'none'], tmp)
+        run('main_preprocessing_lsst_from_parquet.py', [pq], tmp)            # default: --weight none, no suffix
+        assert not os.path.exists(os.path.join(tmp, 'train_data_combined_ftransfer_lsst_test_wnone.pth'))
+        t_none = torch.load(os.path.join(tmp, 'train_data_combined_ftransfer_lsst_test.pth'), weights_only=False)
+        t_w = torch.load(os.path.join(tmp, 'train_data_combined_ftransfer_lsst_test_winvvar.pth'), weights_only=False)
+        assert t_none.shape[-1] == 2 * DIM + 1 and t_w.shape[-1] == 3 * DIM + 1, 'default preprocessing must have no weight channel'
 
-        def train(tag, *extra):
+        def train(tag, *extra, expect_fail=False):
             return run('tan_unsupervised_lsst.py',
                        ['--dim', '4', '--latent-dim', '4', '--rec-hidden', '16', '--gen-hidden', '16',
                         '--embed-time', '16', '--enc', 'mtan_rnn', '--dec', 'mtan_rnn', '--kl', '--learn-emb',
                         '--ref-resolution-days', '2', '--niters', '2', '--dataset', f'lsst_{tag}',
                         '--train_val_test_min_max_times_filename', f'./train_val_test_min_max_times_{tag}.npy',
-                        *extra], tmp)
+                        *extra], tmp, expect_fail=expect_fail)
 
-        out = train('ftransfer_lsst_test_winvvar')
+        W = 'ftransfer_lsst_test_winvvar'
+        out = train(W)                                     # automatic: channel present -> weighted
         assert 'Weighted loss and metrics: True' in out and 'val_mse_unw' in out, out[-2000:]
-        out = train('ftransfer_lsst_test_winvvar', '--no-use-weights')
+        out = train(W, '--use-weights')                    # explicit, same
+        assert 'Weighted loss and metrics: True' in out, out[-2000:]
+        out = train(W, '--no-use-weights')
         assert 'Weighted loss and metrics: False' in out and 'val_mse_unw' not in out, out[-2000:]
-        base = 'lsst_ftransfer_lsst_test_winvvar_mtan_rnn_mtan_rnn'
-        assert os.path.exists(os.path.join(tmp, base + '.h5')), 'weighted checkpoint missing'
-        assert os.path.exists(os.path.join(tmp, base + '_noweights.h5')), \
-            'the --no-use-weights run must not overwrite the weighted checkpoint'
-        out = train('ftransfer_lsst_test', '--run-suffix', '_x')   # no weight channel
-        assert os.path.exists(os.path.join(tmp, 'lsst_ftransfer_lsst_test_mtan_rnn_mtan_rnn_x.h5'))
-        assert 'WARNING: --use-weights requested' in out and 'val_mse_unw' not in out, out[-2000:]
+        base = f'lsst_{W}_mtan_rnn_mtan_rnn'
+        for suffix in ('_weights', '_noweights'):
+            assert os.path.exists(os.path.join(tmp, base + suffix + '.h5')), f'checkpoint {base + suffix}.h5 missing'
+        assert not os.path.exists(os.path.join(tmp, base + '.h5')), 'the checkpoint name must always carry weights/noweights'
+
+        out = train('ftransfer_lsst_test', '--run-suffix', '_x')     # no weight channel: automatic -> unweighted
+        assert 'Weighted loss and metrics: False' in out and 'val_mse_unw' not in out, out[-2000:]
+        assert os.path.exists(os.path.join(tmp, 'lsst_ftransfer_lsst_test_mtan_rnn_mtan_rnn_noweights_x.h5'))
+        out = train('ftransfer_lsst_test', '--use-weights', expect_fail=True)   # explicit weights without channel
+        assert '--use-weights requested but the data has no weight channel' in out, out[-2000:]
         print('ok test_end_to_end')
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

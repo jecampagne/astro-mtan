@@ -20,7 +20,9 @@ parser.add_argument('--tag', type=str, required=True,
                     help='Suffix of the preprocessing files, e.g. ftransfer_lsst_2026_06_29_882968')
 parser.add_argument('--setting', type=str, default='test', choices=['test', 'val', 'train'])
 parser.add_argument('--model_file', type=str, default=None,
-                    help='Default: lsst_<tag>_mtan_rnn_mtan_rnn.h5 (name written by tan_unsupervised_lsst.py --dataset lsst_<tag>)')
+                    help='Checkpoint to evaluate. Default: lsst_<tag>_mtan_rnn_mtan_rnn_weights.h5 or ..._noweights.h5 '
+                         '(names written by tan_unsupervised_lsst.py for a run without --run-suffix); an error if both exist, '
+                         'then pass --model_file. A checkpoint of an older run, lsst_<tag>_mtan_rnn_mtan_rnn.h5, is the last fallback.')
 parser.add_argument('--latent-dim', type=int, default=None,
                     help='Default: read from the checkpoint. If given, it must match training.')
 parser.add_argument('--run-suffix', type=str, default=None,
@@ -66,7 +68,25 @@ store_decoded_lcs = True
 SETTING = args.setting  # 'test', 'val' or 'train'
 DATA_COMBINED_PATH = f'{SETTING}_data_combined_{TAG}.pth'
 DATA_IDS_PATH = f'{SETTING}_objIds_{TAG}.npy'
-model_file_path = args.model_file or f'lsst_{TAG}_mtan_rnn_mtan_rnn.h5'
+
+
+def find_default_checkpoint(tag):
+    """Checkpoint of `tag` when --model_file is not given: the one existing among lsst_<tag>_mtan_rnn_mtan_rnn_weights.h5 and
+    ..._noweights.h5 (runs without --run-suffix). Both -> error (ambiguous); none -> the pre-naming file
+    lsst_<tag>_mtan_rnn_mtan_rnn.h5 if it exists, else an error listing the expected names."""
+    base = f'lsst_{tag}_mtan_rnn_mtan_rnn'
+    found = [f for f in (f'{base}_weights.h5', f'{base}_noweights.h5') if os.path.exists(f)]
+    if len(found) == 1:
+        return found[0]
+    if len(found) == 2:
+        raise SystemExit(f'Ambiguous: both {found[0]} and {found[1]} exist. Pass --model_file to choose.')
+    if os.path.exists(f'{base}.h5'):
+        return f'{base}.h5'
+    raise SystemExit(f'No default checkpoint for tag {tag!r}: expected {base}_weights.h5 or {base}_noweights.h5 '
+                     f'(or pass --model_file).')
+
+
+model_file_path = args.model_file or find_default_checkpoint(TAG)
 
 
 def run_suffix_from(model_path, tag):

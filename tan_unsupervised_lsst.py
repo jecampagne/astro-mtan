@@ -56,11 +56,12 @@ parser.add_argument('--train_val_test_min_max_times_filename', type=str, default
 parser.add_argument('--ref-resolution-days', type=float, default=2)
 parser.add_argument('--run-suffix', type=str, default='',
                     help="Optional suffix added to the name of the best-checkpoint file "
-                         "(<dataset>_<enc>_<dec>[_noweights]<run-suffix>.h5).")
-parser.add_argument('--use-weights', action=argparse.BooleanOptionalAction, default=True,
+                         "(<dataset>_<enc>_<dec>_weights|_noweights<run-suffix>.h5).")
+parser.add_argument('--use-weights', action=argparse.BooleanOptionalAction, default=None,
                     help="Weight the data-fit term and the MSE by the per-point weight channel "
-                         "([data | mask | weight | time] tensors made by main_preprocessing_lsst_from_parquet.py). "
-                         "Ignored (with a warning) if the data has no weight channel.")
+                         "([data | mask | weight | time] tensors made by main_preprocessing_lsst_from_parquet.py --weight n|sqrt_n|invvar). "
+                         "Default: automatic = weighted if the data has a weight channel, unweighted otherwise. "
+                         "--use-weights on data without weight channel is an error; --no-use-weights ignores the channel.")
 parser.add_argument('--tag', type=str, default=None,
                     help="Suffix of the preprocessing files (train_dataloader_<tag>.pth, ...). "
                          "Default: deduced from --train_val_test_min_max_times_filename.")
@@ -89,17 +90,22 @@ if __name__ == '__main__':
     dim = args.dim
 
     # Weighting of the likelihood / metrics (only possible if the data has the weight channel).
+    #   --use-weights unset -> automatic: weighted iff the data has the channel
+    #   --use-weights       -> weighted; error if the data has no channel
+    #   --no-use-weights    -> unweighted (the channel, if any, is ignored)
     _has_weight_channel = mtan_utils.has_weight_channel(next(iter(val_loader))[0], dim)
-    if args.use_weights and not _has_weight_channel:
-        print('WARNING: --use-weights requested but the data has no weight channel: running UNWEIGHTED.')
-        args.use_weights = False
+    if args.use_weights is None:
+        args.use_weights = _has_weight_channel
+    elif args.use_weights and not _has_weight_channel:
+        raise SystemExit('ERROR: --use-weights requested but the data has no weight channel '
+                         '(preprocess with main_preprocessing_lsst_from_parquet.py --weight n|sqrt_n|invvar).')
     elif _has_weight_channel and not args.use_weights:
         print('Data has a weight channel but --no-use-weights was given: running UNWEIGHTED.')
     print('Weighted loss and metrics:', args.use_weights)
 
-    # Name of the best-checkpoint file. Running on data that HAS a weight channel with --no-use-weights would write
-    # to the same file as the weighted run: tag it. Without weight channel (old data) the name is unchanged.
-    _weight_tag = '_noweights' if (_has_weight_channel and not args.use_weights) else ''
+    # Name of the best-checkpoint file: always carries the weighting mode, so that a weighted and an unweighted run
+    # on the same data never share a file name.
+    _weight_tag = '_weights' if args.use_weights else '_noweights'
     ckpt_name = args.dataset + '_' + args.enc + '_' + args.dec + _weight_tag + args.run_suffix + '.h5'
     print('Best checkpoint will be saved to:', ckpt_name)
 

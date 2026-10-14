@@ -13,6 +13,13 @@
 #SBATCH --error=mTan_train_%j.out
 
 # Usage: sbatch train.slurm train_val_test_min_max_times_<TAG>.npy [extra args for tan_unsupervised_lsst.py]
+#
+# Weighting of the likelihood: nothing to set here. tan_unsupervised_lsst.py is weighted iff the data has a weight
+# channel (preprocessing with --weight n|sqrt_n|invvar, TAG suffixed _w<mode>); the default preprocessing
+# (--weight none) has none, so the run is unweighted. Add --no-use-weights to ignore an existing channel.
+# The checkpoint is named lsst_<TAG>_mtan_rnn_mtan_rnn_weights|_noweights[<--run-suffix>].h5.
+# Options given after the .npy file override the ones below (argparse keeps the last value),
+# e.g.  --niters 1000 --seed 1 --run-suffix _s1
 MINMAX=$1; shift
 TAG=$(basename "$MINMAX" .npy); TAG=${TAG#train_val_test_min_max_times_}
 
@@ -24,6 +31,6 @@ set -x
 srun /gpfslocalsup/pub/idrtools/bind_gpu.sh python -u ./tan_unsupervised_lsst.py \
     --dim 4 --latent-dim 4 --rec-hidden 64 --gen-hidden 50 --embed-time 128 \
     --enc mtan_rnn --dec mtan_rnn --enc-num-heads 1 --dec-num-heads 1 \
-    --lr 1e-4 --k-iwae 5 --kl --learn-emb --ref-resolution-days 2 \
-    --niters 300 --dataset lsst_${TAG} \
+    --lr 3e-4 --std 0.01 --k-iwae 5 --kl --learn-emb --ref-resolution-days 2 \
+    --niters 2000 --dataset lsst_${TAG} \
     --train_val_test_min_max_times_filename "$MINMAX" "$@"

@@ -2,6 +2,13 @@
 *.npy
 *.parquet
 *.tgz
+*.out
+*.h5
+*.npz
+evaluate_test_*
+evaluate_val_*
+archives*
+figures*
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store

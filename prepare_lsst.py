@@ -27,7 +27,9 @@ def night_index(jd):
 def combine_same_night_same_band(d):
     """
     Merge detections of the same object, in the same band, during the same night.
-    `d` has columns objectId, jd, fid, flux, err (flux in nJy, err = 1-sigma).
+    `d` has columns objectId, jd, fid, flux, err (flux in nJy, err = 1-sigma) and optionally n
+    (number of detections already represented by each row; 1 if absent).
+    The output also has the column n = total number of merged detections.
     Inverse-variance weighted mean (w = 1/err^2):
         flux = sum(w*flux)/sum(w),   err = 1/sqrt(sum(w)),   jd = sum(w*jd)/sum(w)
     A night with a single detection is left unchanged.
@@ -35,10 +37,12 @@ def combine_same_night_same_band(d):
     w = 1.0 / d["err"].values ** 2
     work = pd.DataFrame({"objectId": d["objectId"].values, "fid": d["fid"].values,
                          "night": night_index(d["jd"].values),
-                         "w": w, "wf": w * d["flux"].values, "wt": w * d["jd"].values})
-    s = work.groupby(["objectId", "fid", "night"], sort=False)[["w", "wf", "wt"]].sum().reset_index()
+                         "w": w, "wf": w * d["flux"].values, "wt": w * d["jd"].values,
+                         "n": d["n"].values if "n" in d.columns else 1})
+    s = work.groupby(["objectId", "fid", "night"], sort=False)[["w", "wf", "wt", "n"]].sum().reset_index()
     out = pd.DataFrame({"objectId": s["objectId"], "fid": s["fid"], "jd": s["wt"] / s["w"],
-                        "flux": s["wf"] / s["w"], "err": 1.0 / np.sqrt(s["w"])})
+                        "flux": s["wf"] / s["w"], "err": 1.0 / np.sqrt(s["w"]),
+                        "n": s["n"].astype("int64")})
     print(f"same-night/same-band combination: {len(d)} -> {len(out)} points "
           f"({len(d) - len(out)} merged)")
     return out
@@ -81,7 +85,7 @@ def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0, combine_nights=True):
         "objectId": df["diaObjectId"].astype("int64").astype(str).values,
         "jd": df["midpointMjdTai"].values,             # MJD in days: only time differences matter
         "fid": df["band"].map(BAND2FID).astype(int).values,
-        "flux": flux.values, "err": err.values})
+        "flux": flux.values, "err": err.values, "n": 1})
     if combine_nights:
         det = combine_same_night_same_band(det)
 
@@ -91,6 +95,7 @@ def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0, combine_nights=True):
         "fid": det["fid"].values,
         "magpsf": NJY_AB_ZP - 2.5 * np.log10(det["flux"].values),
         "sigmapsf": 1.0857 * det["err"].values / det["flux"].values,
+        "n_combined": det["n"].values.astype("int64"),   # number of detections merged in this point (1 = single)
         # get_lc / prepare_data read these label columns; without Fink classes we use a single label.
         "finkclass": "lsst",
         "tnsclass": "Unknown",
@@ -99,6 +104,53 @@ def load_lsst_alerts(path, flux_mode="diff", snr_min=5.0, combine_nights=True):
     print(f"{n0} rows -> {len(out)} detections kept "
           f"({out.objectId.nunique()} objects, flux_mode={flux_mode}, snr>{snr_min})")
     return out
+
+
+WEIGHT_MODES = ("none", "invvar", "n", "sqrt_n")
+
+
+def compute_weights(df, mode="invvar", floor_mag=0.05):
+    """
+    Per-point weight of the data-fit term of the likelihood, normalised to a mean of 1 over `df`
+    (so the overall scale of the reconstruction term, hence the KL/reconstruction balance, is unchanged).
+
+    mode:
+      'invvar' -> 1 / (sigmapsf^2 + floor_mag^2). sigmapsf of a merged point is already
+                  1.0857 / sqrt(sum 1/sigma_i^2) (see combine_same_night_same_band), so a merged point weighs
+                  more than a single one. `floor_mag` (mag) is an intrinsic / model error floor: without it the
+                  weights would span several orders of magnitude and a few bright points would dominate.
+                  With floor_mag = 0.05 the weight ratio is bounded by ~20 for snr_min = 5.
+      'n'      -> n_combined (number of merged detections). With equal sigmas this is exactly the likelihood
+                  of the un-merged data minus the within-night scatter (a constant).
+      'sqrt_n' -> sqrt(n_combined), a compromise between 1 and n.
+    Returns a numpy array aligned with df's rows. Use mode='none' to skip weighting (returns None).
+    """
+    if mode == "none":
+        return None
+    if mode == "invvar":
+        w = 1.0 / (df["sigmapsf"].values.astype("float64") ** 2 + float(floor_mag) ** 2)
+    elif mode in ("n", "sqrt_n"):
+        if "n_combined" not in df.columns:
+            raise ValueError(f"weight mode '{mode}' needs the 'n_combined' column: regenerate the parquet "
+                             "with the current make_parquet_lsst.py.")
+        n = df["n_combined"].values.astype("float64")
+        w = n if mode == "n" else np.sqrt(n)
+    else:
+        raise ValueError(f"unknown weight mode '{mode}', expected one of {WEIGHT_MODES}")
+    if not np.all(np.isfinite(w)) or np.any(w <= 0):
+        raise ValueError("non-positive or non-finite weights (check sigmapsf / n_combined).")
+    return w / w.mean()
+
+
+def weight_summary(w, n_combined=None):
+    """One-line diagnostic of a weight vector (concentration of the weight on the heaviest points)."""
+    ws = np.sort(w)[::-1]
+    top = max(1, int(0.01 * len(ws)))
+    msg = (f"weights: min={w.min():.3f} median={np.median(w):.3f} max={w.max():.3f}; "
+           f"heaviest 1% of points carry {ws[:top].sum() / ws.sum():.1%} of the total weight")
+    if n_combined is not None and np.std(n_combined) > 0 and np.std(w) > 0:
+        msg += f"; corr(weight, log n_combined)={np.corrcoef(w, np.log(n_combined))[0, 1]:.2f}"
+    return msg
 
 
 def count_nights(jd):

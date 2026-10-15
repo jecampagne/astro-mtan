@@ -29,10 +29,24 @@ def normal_kl(mu1, lv1, mu2, lv2):
     return kl
 
 
-def mean_squared_error(orig, pred, mask):
+def mean_squared_error(orig, pred, mask, weight=None):
+    """Masked MSE. With `weight` (same shape as mask), a weighted MSE: sum(w*mask*err^2) / sum(w*mask)."""
     error = (orig - pred) ** 2
-    error = error * mask
-    return error.sum() / mask.sum()
+    w = mask if weight is None else mask * weight
+    error = error * w
+    return error.sum() / w.sum()
+
+
+def has_weight_channel(batch, dim):
+    """True if `batch` is [data | mask | weight | time] (3*dim + 1 channels) rather than [data | mask | time]."""
+    return batch.shape[-1] == 3 * dim + 1
+
+
+def get_point_weight(batch, dim, args):
+    """The (B, T, dim) weight block of `batch` if args.use_weights is set and the data has one, else None."""
+    if getattr(args, 'use_weights', False) and has_weight_channel(batch, dim):
+        return batch[:, :, 2 * dim:3 * dim]
+    return None
 
 def residual(orig, pred, mask):
     error = orig - pred
@@ -64,10 +78,16 @@ def normalize_masked_data(data, mask, att_min, att_max):
     return data_norm, att_min, att_max
 
 
-def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda", kl_coef=None, return_mse=True, train_val_test_min_max_times_filename='train_val_test_min_max_times.npy'):
+def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda", kl_coef=None, return_mse=True, train_val_test_min_max_times_filename='train_val_test_min_max_times.npy',
+             weighted=None, return_both=False):
     """
     If return_mse is False, the average ELBO will be returned. In this case, both kl_coef and k_iwae will be used; the latter is found from `args` and kl_coef must be given.
     If return_mse is True, mse is returned.
+
+    The MSE is the mean over curves of the per-curve MSE. `weighted` selects whether the points are weighted inside
+    each curve (default: args.use_weights, and only if the data has a weight channel). With return_both=True and
+    return_mse=True, the tuple (mse, mse_unweighted) is returned, where mse follows `weighted`. The ELBO always follows
+    args.use_weights.
     """
     if not return_mse and kl_coef is None:
         raise ValueError('kl_coef must be provided is return_mse is False.')
@@ -77,7 +97,7 @@ def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda", kl_
     train_max_time = train_val_test_min_max_times[1]
     delta_t = (args.ref_resolution_days * 24) / train_max_time
 
-    mse, test_n = 0.0, 0.0
+    mse, mse_unw, test_n = 0.0, 0.0, 0.0
     test_loss = 0
     with torch.no_grad():
         for batch in test_loader:
@@ -134,7 +154,13 @@ def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda", kl_
             pred_x = dec(z0, time_steps, query)
             pred_x = pred_x.view(num_sample, -1, pred_x.shape[1], pred_x.shape[2])
             pred_x = pred_x.mean(0)
-            mse += mean_squared_error(observed_data, pred_x, observed_mask) * batch
+            has_w = has_weight_channel(test_batch, dim)
+            use_w = (getattr(args, 'use_weights', False) if weighted is None else weighted) and has_w
+            mse_u = mean_squared_error(observed_data, pred_x, observed_mask)
+            mse_w = mean_squared_error(observed_data, pred_x, observed_mask,
+                                       weight=test_batch[:, :, 2 * dim:3 * dim]) if use_w else mse_u
+            mse += mse_w * batch
+            mse_unw += mse_u * batch
             test_n += batch
 
             # compute loss
@@ -145,6 +171,8 @@ def evaluate(dim, rec, dec, test_loader, args, num_sample=10, device="cuda", kl_
                 test_loss += loss.item() * batch_len
 
     if return_mse:
+        if return_both:
+            return mse / test_n, mse_unw / test_n
         return mse / test_n
     else:
         return test_loss / test_n
@@ -157,8 +185,12 @@ def compute_losses(dim, dec_train_batch, qz0_mean, qz0_logvar, pred_x, args, dev
     noise_std = args.std  # default 0.1
     noise_std_ = torch.zeros(pred_x.size()).to(device) + noise_std
     noise_logvar = 2. * torch.log(noise_std_).to(device)
+    # Optional per-point weights: the data-fit term of a point is multiplied by its weight (equivalent to a
+    # Gaussian of variance std^2 / weight). Weights are 0 where the mask is 0, so padding stays inert.
+    point_weight = get_point_weight(dec_train_batch, dim, args)
+    loss_mask = observed_mask if point_weight is None else observed_mask * point_weight
     logpx = log_normal_pdf(observed_data, pred_x, noise_logvar,
-                           observed_mask).sum(-1).sum(-1)
+                           loss_mask).sum(-1).sum(-1)
     pz0_mean = pz0_logvar = torch.zeros(qz0_mean.size()).to(device)
     analytic_kl = normal_kl(qz0_mean, qz0_logvar,
                             pz0_mean, pz0_logvar).sum(-1).sum(-1)
@@ -285,8 +317,13 @@ def get_mimiciii_data(args):
 
 
 def variable_time_collate_fn(batch, device=torch.device("cpu"), classify=False, activity=False,
-                             data_min=None, data_max=None, train_min_time=None, train_max_time=None):
+                             data_min=None, data_max=None, train_min_time=None, train_max_time=None,
+                             weights=None):
     """
+    If `weights` is given (a list parallel to `batch` of (T, D) tensors, 0 where the mask is 0), the returned
+    tensor is [data | mask | weight | time] (3D + 1 channels) instead of [data | mask | time] (2D + 1).
+    The time stays in the last channel, and data / mask keep their indices.
+
     Expects a batch of time series data in the form of (record_id, tt, vals, mask, labels) where
       - record_id is a patient id
       - tt is a 1-dimensional tensor containing T time values of observations.
@@ -306,6 +343,9 @@ def variable_time_collate_fn(batch, device=torch.device("cpu"), classify=False, 
     enc_combined_tt = torch.zeros([len(batch), maxlen]).to(device)
     enc_combined_vals = torch.zeros([len(batch), maxlen, D]).to(device)
     enc_combined_mask = torch.zeros([len(batch), maxlen, D]).to(device)
+    if weights is not None:
+        assert len(weights) == len(batch)
+        enc_combined_weight = torch.zeros([len(batch), maxlen, D]).to(device)
     if classify:
         if activity:
             combined_labels = torch.zeros([len(batch), maxlen, N]).to(device)
@@ -332,6 +372,9 @@ def variable_time_collate_fn(batch, device=torch.device("cpu"), classify=False, 
         enc_combined_vals[b, :currlen] = vals.to(device)
 
         enc_combined_mask[b, :currlen] = mask.to(device)
+        if weights is not None:
+            assert weights[b].shape == mask.shape, (record_id, weights[b].shape, mask.shape)
+            enc_combined_weight[b, :currlen] = weights[b].to(device)
         if classify:
             if activity:
                 combined_labels[b, :currlen] = labels.to(device)
@@ -362,8 +405,12 @@ def variable_time_collate_fn(batch, device=torch.device("cpu"), classify=False, 
         #assert torch.all((enc_combined_tt >= 0) & (enc_combined_tt <= 1))
         #enc_combined_tt = enc_combined_tt / torch.max(enc_combined_tt)
 
-    combined_data = torch.cat(
-        (enc_combined_vals, enc_combined_mask, enc_combined_tt.unsqueeze(-1)), 2)
+    if weights is not None:
+        combined_data = torch.cat(
+            (enc_combined_vals, enc_combined_mask, enc_combined_weight, enc_combined_tt.unsqueeze(-1)), 2)
+    else:
+        combined_data = torch.cat(
+            (enc_combined_vals, enc_combined_mask, enc_combined_tt.unsqueeze(-1)), 2)
     if classify:
         return combined_data, combined_labels
     else:

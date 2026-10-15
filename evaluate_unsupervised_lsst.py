@@ -8,6 +8,8 @@ from torch.utils.data import DataLoader
 from prepare_data_lsst import MyDataSet
 from torch.nn.utils.rnn import pad_sequence
 
+import json
+import os
 import time
 import argparse
 
@@ -18,31 +20,85 @@ parser.add_argument('--tag', type=str, required=True,
                     help='Suffix of the preprocessing files, e.g. ftransfer_lsst_2026_06_29_882968')
 parser.add_argument('--setting', type=str, default='test', choices=['test', 'val', 'train'])
 parser.add_argument('--model_file', type=str, default=None,
-                    help='Default: lsst_<tag>_mtan_rnn_mtan_rnn.h5 (name written by tan_unsupervised_lsst.py --dataset lsst_<tag>)')
-parser.add_argument('--latent-dim', type=int, default=4, help='Must match training.')
+                    help='Checkpoint to evaluate. Default: lsst_<tag>_mtan_rnn_mtan_rnn_weights.h5 or ..._noweights.h5 '
+                         '(names written by tan_unsupervised_lsst.py for a run without --run-suffix); an error if both exist, '
+                         'then pass --model_file. A checkpoint of an older run, lsst_<tag>_mtan_rnn_mtan_rnn.h5, is the last fallback.')
+parser.add_argument('--latent-dim', type=int, default=None,
+                    help='Default: read from the checkpoint. If given, it must match training.')
+parser.add_argument('--run-suffix', type=str, default=None,
+                    help='Suffix of the output files (evaluate_<setting>_..._<tag><run-suffix>.*). Default: derived '
+                         'from the checkpoint name, i.e. what follows lsst_<tag>_mtan_rnn_mtan_rnn in it '
+                         "('' for the default checkpoint, '_noweights_s1' for lsst_<tag>_mtan_rnn_mtan_rnn_noweights_s1.h5), "
+                         'so that evaluating several runs of the same data never overwrites the outputs.')
 args = parser.parse_args()
 TAG = args.tag
 
 #device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 device = torch.device('cpu')  # Force to use CPU for evaluation since that closely mimics how the model will be used in real applications.
 # TODO: Add option to pass these arguments as argument parsers. These values must match from training. So instead save a training parameter file and simply load it here.
-ref_resolution_days = 2
-latent_dim = args.latent_dim
-learn_emb = True
-rec_hidden = 64
-gen_hidden = 50
-enc_num_heads = 1
-dec_num_heads = 1
+# Model hyperparameters are read from the checkpoint (args saved by tan_unsupervised_lsst.py); the values below are
+# the fallbacks for a checkpoint that does not carry them, and the initial values of the module-level names.
+HP_DEFAULTS = dict(latent_dim=4, rec_hidden=64, gen_hidden=50, embed_time=128, enc_num_heads=1, dec_num_heads=1,
+                   ref_resolution_days=2, learn_emb=True)
+
+
+def resolve_hparams(ck_args, cli_latent_dim=None):
+    """Hyperparameters of the checkpoint (training args), falling back on HP_DEFAULTS. --latent-dim, if given, must agree."""
+    hp = {k: (getattr(ck_args, k, v) if ck_args is not None else v) for k, v in HP_DEFAULTS.items()}
+    if cli_latent_dim is not None:
+        if ck_args is not None and hasattr(ck_args, 'latent_dim') and cli_latent_dim != ck_args.latent_dim:
+            raise ValueError(f'--latent-dim {cli_latent_dim} differs from the checkpoint ({ck_args.latent_dim}).')
+        hp['latent_dim'] = cli_latent_dim
+    return hp
+
+
+ref_resolution_days = HP_DEFAULTS['ref_resolution_days']
+latent_dim = args.latent_dim if args.latent_dim is not None else HP_DEFAULTS['latent_dim']
+learn_emb = HP_DEFAULTS['learn_emb']
+rec_hidden = HP_DEFAULTS['rec_hidden']
+gen_hidden = HP_DEFAULTS['gen_hidden']
+enc_num_heads = HP_DEFAULTS['enc_num_heads']
+dec_num_heads = HP_DEFAULTS['dec_num_heads']
 sample_tp = 1.0
 num_sample = 1
-embed_time = 128
+embed_time = HP_DEFAULTS['embed_time']
 dim = 4  # g,r,i,z (Rubin/LSST). Use 2 for ZTF g,r.
 seed = 42
 store_decoded_lcs = True
 SETTING = args.setting  # 'test', 'val' or 'train'
 DATA_COMBINED_PATH = f'{SETTING}_data_combined_{TAG}.pth'
 DATA_IDS_PATH = f'{SETTING}_objIds_{TAG}.npy'
-model_file_path = args.model_file or f'lsst_{TAG}_mtan_rnn_mtan_rnn.h5'
+
+
+def find_default_checkpoint(tag):
+    """Checkpoint of `tag` when --model_file is not given: the one existing among lsst_<tag>_mtan_rnn_mtan_rnn_weights.h5 and
+    ..._noweights.h5 (runs without --run-suffix). Both -> error (ambiguous); none -> the pre-naming file
+    lsst_<tag>_mtan_rnn_mtan_rnn.h5 if it exists, else an error listing the expected names."""
+    base = f'lsst_{tag}_mtan_rnn_mtan_rnn'
+    found = [f for f in (f'{base}_weights.h5', f'{base}_noweights.h5') if os.path.exists(f)]
+    if len(found) == 1:
+        return found[0]
+    if len(found) == 2:
+        raise SystemExit(f'Ambiguous: both {found[0]} and {found[1]} exist. Pass --model_file to choose.')
+    if os.path.exists(f'{base}.h5'):
+        return f'{base}.h5'
+    raise SystemExit(f'No default checkpoint for tag {tag!r}: expected {base}_weights.h5 or {base}_noweights.h5 '
+                     f'(or pass --model_file).')
+
+
+model_file_path = args.model_file or find_default_checkpoint(TAG)
+
+
+def run_suffix_from(model_path, tag):
+    """'' for the default checkpoint name, else what follows lsst_<tag>_mtan_rnn_mtan_rnn (without .h5)."""
+    base = os.path.basename(model_path)
+    base = base[:-3] if base.endswith('.h5') else base
+    std = f'lsst_{tag}_mtan_rnn_mtan_rnn'
+    return base[len(std):] if base.startswith(std) else '_' + base
+
+
+RUN = args.run_suffix if args.run_suffix is not None else run_suffix_from(model_file_path, TAG)
+OUT = f'{TAG}{RUN}'   # tag used in all output file names
 
 if __name__ == '__main__':
     # Set seed during testing as well since this script samples random values for the variable, epsilon.
@@ -51,6 +107,14 @@ if __name__ == '__main__':
 
     if device == 'cuda':
         torch.cuda.manual_seed(seed)
+
+    # Checkpoint first: its training args give the model hyperparameters (latent_dim, hidden sizes, heads, reference grid).
+    model_file = torch.load(model_file_path, weights_only=False, map_location=device)  # Namespace in checkpoint; tensors saved on GPU -> map to CPU
+    hp = resolve_hparams(model_file.get('args'), args.latent_dim)
+    latent_dim, rec_hidden, gen_hidden, embed_time = hp['latent_dim'], hp['rec_hidden'], hp['gen_hidden'], hp['embed_time']
+    enc_num_heads, dec_num_heads = hp['enc_num_heads'], hp['dec_num_heads']
+    ref_resolution_days, learn_emb = hp['ref_resolution_days'], hp['learn_emb']
+    print('Model hyperparameters (from the checkpoint):', hp)
 
     data_combined = torch.load(DATA_COMBINED_PATH, weights_only=False)
     data_Ids = np.load(DATA_IDS_PATH)
@@ -80,11 +144,19 @@ if __name__ == '__main__':
         dim, latent_dim, gen_hidden,
         embed_time=embed_time, learn_emb=learn_emb, num_heads=dec_num_heads, device=device).to(device)
 
-    model_file = torch.load(model_file_path, weights_only=False, map_location=device)  # Namespace in checkpoint; tensors saved on GPU -> map to CPU
     rec.load_state_dict(model_file['rec_state_dict'])
     rec.eval()
     dec.load_state_dict(model_file['dec_state_dict'])
     dec.eval()
+
+    ck_args = model_file.get('args')
+    ck_epoch = model_file.get('epoch')
+    ck_use_weights = getattr(ck_args, 'use_weights', None)   # None: checkpoint older than the weighting
+    print(f"Checkpoint {model_file_path}: epoch {ck_epoch}, trained with use_weights={ck_use_weights}, "
+          f"seed={getattr(ck_args, 'seed', None)}, dataset={getattr(ck_args, 'dataset', None)}")
+    print(f"Output files tagged: {OUT}")
+    has_weight_channel = data_combined.shape[-1] == 3 * dim + 1
+    print(f"Data has a weight channel: {has_weight_channel}")
 
     ########### Check model size ###########
     def get_model_size(model):
@@ -105,9 +177,10 @@ if __name__ == '__main__':
 
     outputs = []
     objIds = []
-    test_n, mse = 0, 0.0
+    test_n, mse, mse_w = 0, 0.0, 0.0
     if store_decoded_lcs:
         decoded_lcs = []
+        weights_lcs = []
 
     start = time.time()
 
@@ -179,6 +252,10 @@ if __name__ == '__main__':
                 pred_x = pred_x.view(num_sample, -1, pred_x.shape[1], pred_x.shape[2])
                 pred_x = pred_x.mean(0)
                 mse += mean_squared_error(observed_data, pred_x, observed_mask) * batch
+                if has_weight_channel:
+                    point_weight = test_batch[:, :, 2 * dim:3 * dim]
+                    mse_w += mean_squared_error(observed_data, pred_x, observed_mask, weight=point_weight) * batch
+                    weights_lcs.append(point_weight.cpu().detach().numpy()[0])   # (T, dim), 0 where not observed
                 test_n += batch
 
                 #print(pred_x.shape, time_steps.shape, time_steps.unsqueeze(2).shape)
@@ -206,12 +283,23 @@ if __name__ == '__main__':
     objIds = list(chain.from_iterable(objIds))
 
     if store_decoded_lcs:
-        print(f'MSE = {mse/test_n}')
+        print(f'MSE = {mse/test_n}')   # unweighted, mean over curves of the per-curve MSE (same as val_mse_unw)
+        if has_weight_channel:
+            print(f'MSE weighted = {mse_w/test_n}')
 
-    np.save(f'evaluate_{SETTING}_outputs_condensed_{TAG}.npy', outputs_condensed)
-    np.save(f'evaluate_{SETTING}_objIds_dataloader_{TAG}.npy', objIds)
+    np.save(f'evaluate_{SETTING}_outputs_condensed_{OUT}.npy', outputs_condensed)
+    np.save(f'evaluate_{SETTING}_objIds_dataloader_{OUT}.npy', objIds)
 
     assert np.all(objIds == data_Ids)
 
     if store_decoded_lcs:
-        np.savez(f'evaluate_{SETTING}_decoded_lcs_{TAG}.npz', *decoded_lcs)
+        np.savez(f'evaluate_{SETTING}_decoded_lcs_{OUT}.npz', *decoded_lcs)
+        if has_weight_channel:
+            np.savez(f'evaluate_{SETTING}_weights_{OUT}.npz', *weights_lcs)
+        info = dict(tag=TAG, run=RUN, setting=SETTING, checkpoint=model_file_path, epoch=ck_epoch,
+                    use_weights=ck_use_weights, seed=getattr(ck_args, 'seed', None), n_curves=len(dataset),
+                    mse_unweighted=float(mse / test_n),
+                    mse_weighted=float(mse_w / test_n) if has_weight_channel else None)
+        with open(f'evaluate_{SETTING}_info_{OUT}.json', 'w') as f:
+            json.dump(info, f, indent=2)
+        print('Summary:', info)

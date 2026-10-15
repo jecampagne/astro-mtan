@@ -54,6 +54,14 @@ parser.add_argument('--dim', type=int, help='dim value')
 parser.add_argument('--use_wandb', action='store_true', help='whether to use wandb')
 parser.add_argument('--train_val_test_min_max_times_filename', type=str, default='train_val_test_min_max_times.npy')
 parser.add_argument('--ref-resolution-days', type=float, default=2)
+parser.add_argument('--run-suffix', type=str, default='',
+                    help="Optional suffix added to the name of the best-checkpoint file "
+                         "(<dataset>_<enc>_<dec>_weights|_noweights<run-suffix>.h5).")
+parser.add_argument('--use-weights', action=argparse.BooleanOptionalAction, default=None,
+                    help="Weight the data-fit term and the MSE by the per-point weight channel "
+                         "([data | mask | weight | time] tensors made by main_preprocessing_lsst_from_parquet.py --weight n|sqrt_n|invvar). "
+                         "Default: automatic = weighted if the data has a weight channel, unweighted otherwise. "
+                         "--use-weights on data without weight channel is an error; --no-use-weights ignores the channel.")
 parser.add_argument('--tag', type=str, default=None,
                     help="Suffix of the preprocessing files (train_dataloader_<tag>.pth, ...). "
                          "Default: deduced from --train_val_test_min_max_times_filename.")
@@ -80,6 +88,26 @@ if __name__ == '__main__':
     val_loader = torch.load(f'val_dataloader{_sfx}.pth', weights_only=False)
     test_loader = torch.load(f'test_dataloader{_sfx}.pth', weights_only=False)
     dim = args.dim
+
+    # Weighting of the likelihood / metrics (only possible if the data has the weight channel).
+    #   --use-weights unset -> automatic: weighted iff the data has the channel
+    #   --use-weights       -> weighted; error if the data has no channel
+    #   --no-use-weights    -> unweighted (the channel, if any, is ignored)
+    _has_weight_channel = mtan_utils.has_weight_channel(next(iter(val_loader))[0], dim)
+    if args.use_weights is None:
+        args.use_weights = _has_weight_channel
+    elif args.use_weights and not _has_weight_channel:
+        raise SystemExit('ERROR: --use-weights requested but the data has no weight channel '
+                         '(preprocess with main_preprocessing_lsst_from_parquet.py --weight n|sqrt_n|invvar).')
+    elif _has_weight_channel and not args.use_weights:
+        print('Data has a weight channel but --no-use-weights was given: running UNWEIGHTED.')
+    print('Weighted loss and metrics:', args.use_weights)
+
+    # Name of the best-checkpoint file: always carries the weighting mode, so that a weighted and an unweighted run
+    # on the same data never share a file name.
+    _weight_tag = '_weights' if args.use_weights else '_noweights'
+    ckpt_name = args.dataset + '_' + args.enc + '_' + args.dec + _weight_tag + args.run_suffix + '.h5'
+    print('Best checkpoint will be saved to:', ckpt_name)
 
     # model
     if args.enc == 'enc_rnn3':
@@ -133,7 +161,7 @@ if __name__ == '__main__':
     for itr in range(1, args.niters + 1):
         train_loss = 0
         train_n = 0
-        avg_reconst, avg_kl, mse = 0, 0, 0
+        avg_reconst, avg_kl, mse, mse_unw = 0, 0, 0, 0
         val_avg_reconst, val_avg_kl, val_loss = 0, 0, 0
         if args.kl:
             wait_until_kl_inc = 10
@@ -231,8 +259,14 @@ if __name__ == '__main__':
             train_n += batch_len
             avg_reconst += torch.mean(logpx) * batch_len
             avg_kl += torch.mean(analytic_kl) * batch_len
-            mse += mtan_utils.mean_squared_error(
-                observed_data, pred_x.mean(0), observed_mask) * batch_len
+            pred_mean = pred_x.mean(0)
+            mse_u_batch = mtan_utils.mean_squared_error(observed_data, pred_mean, observed_mask)
+            mse_unw += mse_u_batch * batch_len
+            if args.use_weights:
+                mse += mtan_utils.mean_squared_error(
+                    observed_data, pred_mean, observed_mask, weight=train_batch[:, :, 2 * dim:3 * dim]) * batch_len
+            else:
+                mse += mse_u_batch * batch_len
 
             if args.use_wandb:
                 # NOTE: Logging is done for each batch. See https://docs.wandb.ai/guides/integrations/pytorch
@@ -241,7 +275,9 @@ if __name__ == '__main__':
         total_time += time.time() - start_time
         # Run validation
         return_mse = True
-        val_metric = mtan_utils.evaluate(dim, rec, dec, val_loader, args, 1, device=device, kl_coef=kl_coef, return_mse=return_mse, train_val_test_min_max_times_filename=args.train_val_test_min_max_times_filename)
+        val_metric = mtan_utils.evaluate(dim, rec, dec, val_loader, args, 1, device=device, kl_coef=kl_coef, return_mse=return_mse, train_val_test_min_max_times_filename=args.train_val_test_min_max_times_filename, return_both=return_mse)
+        if return_mse:
+            val_metric, val_mse_unw = val_metric   # val_metric follows --use-weights; val_mse_unw never weighted
         if args.use_wandb:
             if return_mse:
                 wandb.log({'val_mse': val_metric})
@@ -260,16 +296,24 @@ if __name__ == '__main__':
                 'rec_state_dict': rec_state_dict,
                 'dec_state_dict': dec_state_dict,
                 'optimizer_state_dict': optimizer_state_dict,
-            }, args.dataset + '_' + args.enc + '_' + args.dec + '.h5')
+            }, ckpt_name)
 
         # Validation end.
         #scheduler.step(val_metric)
         #print(f'learning rate at iteration {itr} = {scheduler.get_last_lr()}')
 
-        print('Iter: {}, avg elbo: {:.4f}, avg reconst: {:.4f}, avg kl: {:.4f}, mse: {:.6f}, val_metric: {:.6f}'
-                .format(itr, train_loss / train_n, -avg_reconst / train_n, avg_kl / train_n, mse / train_n, val_metric))
+        _line = ('Iter: {}, avg elbo: {:.4f}, avg reconst: {:.4f}, avg kl: {:.4f}, mse: {:.6f}, val_metric: {:.6f}'
+                 .format(itr, train_loss / train_n, -avg_reconst / train_n, avg_kl / train_n, mse / train_n, val_metric))
+        if args.use_weights and return_mse:
+            # Same fields as before (mse and val_metric are now weighted); the unweighted values are appended
+            # so that runs stay comparable with the unweighted ones.
+            _line += ', mse_unw: {:.6f}, val_mse_unw: {:.6f}'.format(mse_unw / train_n, val_mse_unw)
+        print(_line)
         if itr % 5 == 0:
-            print('Test Mean Squared Error', mtan_utils.evaluate(dim, rec, dec, test_loader, args, 1, device=device, return_mse=True, train_val_test_min_max_times_filename=args.train_val_test_min_max_times_filename))
+            _test = mtan_utils.evaluate(dim, rec, dec, test_loader, args, 1, device=device, return_mse=True, train_val_test_min_max_times_filename=args.train_val_test_min_max_times_filename, return_both=True)
+            print('Test Mean Squared Error', _test[0])
+            if args.use_weights:
+                print('Test Mean Squared Error (unweighted)', _test[1])
 
     print(f'Time elapsed {total_time/60:.2f} min')
     if args.use_wandb:
